@@ -1,9 +1,11 @@
 import json
 import os
-from datetime import datetime
-from collections import defaultdict
+import re
+from datetime import datetime, timedelta
 
 DATA_FILE = 'expenses.json'
+USERS = ['心怡', '70']
+HISTORY_KEEP_DAYS = 90  # 保留 3 個月
 
 class ExpenseManager:
     def __init__(self):
@@ -13,150 +15,189 @@ class ExpenseManager:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        return {"expenses": [], "cleared": []}
+        # 初始結構
+        return {
+            "expenses": [],
+            "pending_clear": False,
+            "history_log": []   # 每次銷帳後留存的摘要紀錄
+        }
+
+    def _ensure_keys(self):
+        """向下相容：舊資料沒有 history_log 時補上"""
+        if "history_log" not in self.data:
+            self.data["history_log"] = []
 
     def _save(self):
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
 
-    def add_expense(self, payer, amount, description):
+    def parse_expense(self, text):
+        """
+        解析記帳格式：心怡:麥當勞120
+        回傳 (欠款方, 說明, 金額) 或 None
+        """
+        for user in USERS:
+            if text.startswith(user + ':') or text.startswith(user + '：'):
+                rest = text[len(user) + 1:].strip()
+                # 從字串尾端抓數字
+                match = re.search(r'(\d+(?:\.\d+)?)$', rest)
+                if match:
+                    amount = float(match.group(1))
+                    description = rest[:match.start()].strip()
+                    if not description:
+                        description = '未填說明'
+                    return user, description, amount
+        return None
+
+    def add_expense(self, debtor, description, amount):
+        """記錄一筆欠款：debtor 欠另一方"""
+        # 付款方是另一個人
+        creditor = [u for u in USERS if u != debtor][0]
         record = {
             "id": len(self.data["expenses"]) + 1,
-            "payer": payer,
+            "debtor": debtor,       # 欠款方（被記的人）
+            "creditor": creditor,   # 付款方
             "amount": amount,
             "description": description,
-            "date": datetime.now().strftime("%m/%d %H:%M"),
+            "date": datetime.now().strftime("%m/%d"),
             "cleared": False
         }
         self.data["expenses"].append(record)
         self._save()
         return (
-            f"✅ 已記錄！\n"
-            f"──────────────────\n"
-            f"👤 付款人：{payer}\n"
-            f"💴 金額：${amount:.0f}\n"
-            f"📝 說明：{description}\n"
-            f"🕐 時間：{record['date']}\n"
-            f"──────────────────\n"
-            f"輸入「結算」查看欠款狀況"
+            f"✅ 已記錄\n"
+            f"{creditor} 幫 {debtor} 付了 ${amount:.0f}（{description}）"
         )
-
-    def get_summary(self):
-        active = [e for e in self.data["expenses"] if not e["cleared"]]
-        if not active:
-            return "📒 目前沒有未結清的帳目\n\n輸入「歷史」查看所有紀錄"
-
-        lines = ["📒 未結清帳目", "──────────────────"]
-        total_by_person = defaultdict(float)
-
-        for e in active:
-            lines.append(f"#{e['id']} {e['date']} {e['payer']} 付了 ${e['amount']:.0f}（{e['description']}）")
-            total_by_person[e['payer']] += e['amount']
-
-        lines.append("──────────────────")
-        lines.append("📊 各人小計：")
-        for person, total in total_by_person.items():
-            lines.append(f"  {person}：共付 ${total:.0f}")
-
-        lines.append("\n輸入「結算」查看誰欠誰多少")
-        return "\n".join(lines)
 
     def get_balance(self):
+        """結算：計算未結清帳目，回傳結算文字與明細資料"""
         active = [e for e in self.data["expenses"] if not e["cleared"]]
         if not active:
-            return "🎉 目前沒有未結清帳目！"
+            return "🎉 目前沒有未結清帳目！", None
 
-        # 計算每人總付款
-        paid = defaultdict(float)
-        people = set()
+        # 計算每人淨欠款
+        # net[user] = 該 user 欠對方的錢（正數 = 欠，負數 = 被欠）
+        net = {u: 0.0 for u in USERS}
+        details = {u: [] for u in USERS}  # 每人被記的明細
+
         for e in active:
-            paid[e['payer']] += e['amount']
-            people.add(e['payer'])
+            net[e["debtor"]] += e["amount"]
+            details[e["debtor"]].append(f"{e['description']}{e['amount']:.0f}")
 
-        total = sum(paid.values())
-        share = total / len(people) if people else 0
+        # 判斷誰欠誰
+        u0, u1 = USERS[0], USERS[1]
+        diff = net[u0] - net[u1]  # 正 = 心怡欠70，負 = 70欠心怡
 
-        lines = ["💰 結算報告", "──────────────────"]
-        lines.append(f"總金額：${total:.0f}")
-        lines.append(f"人數：{len(people)}人")
-        lines.append(f"每人應付：${share:.0f}")
-        lines.append("──────────────────")
+        if abs(diff) < 0.5:
+            summary = "🟰 目前兩人帳目相抵，不需要還款！"
+        elif diff > 0:
+            summary = f"💸 {u0} 要給 {u1}  ${diff:.0f}"
+        else:
+            summary = f"💸 {u1} 要給 {u0}  ${abs(diff):.0f}"
 
-        debts = []
-        for person in people:
-            diff = paid[person] - share
-            if diff > 0.5:
-                lines.append(f"✅ {person} 多付了 ${diff:.0f}")
-            elif diff < -0.5:
-                lines.append(f"⚠️ {person} 少付了 ${abs(diff):.0f}")
-                debts.append((person, abs(diff)))
-            else:
-                lines.append(f"🟰 {person} 剛好平")
+        # 組明細字串
+        detail_lines = []
+        for user in USERS:
+            if details[user]:
+                items = "+".join(details[user])
+                detail_lines.append(f"{user}：{items}")
 
-        if debts:
-            lines.append("──────────────────")
-            lines.append("📌 應還款：")
-            for person, amount in debts:
-                # 找出多付的人
-                creditors = [(p, paid[p] - share) for p in people if paid[p] - share > 0.5]
-                for creditor, _ in creditors:
-                    lines.append(f"  {person} 需還 {creditor} ${amount:.0f}")
-
-        lines.append("──────────────────")
-        lines.append("還款後輸入：還清 [名字]")
-        return "\n".join(lines)
-
-    def clear_balance(self, person):
-        cleared_count = 0
-        for e in self.data["expenses"]:
-            if e['payer'] == person and not e['cleared']:
-                e['cleared'] = True
-                cleared_count += 1
-        
-        if cleared_count == 0:
-            # 嘗試標記該人的債務已還清（記一筆還款紀錄）
-            record = {
-                "id": len(self.data["expenses"]) + 1,
-                "payer": person,
-                "amount": 0,
-                "description": "【還款記錄】",
-                "date": datetime.now().strftime("%m/%d %H:%M"),
-                "cleared": True
-            }
-            self.data["expenses"].append(record)
-            self._save()
-            return f"✅ 已標記 {person} 的帳目已結清！"
-
-        self._save()
-        return (
-            f"✅ 已將 {person} 的 {cleared_count} 筆帳目標記為已結清！\n"
-            f"輸入「帳目」查看剩餘未結清項目"
-        )
-
-    def delete_last(self):
-        active = [e for e in self.data["expenses"] if not e["cleared"]]
-        if not active:
-            return "沒有可刪除的帳目"
-        last = active[-1]
-        self.data["expenses"].remove(last)
-        self._save()
-        return (
-            f"🗑️ 已刪除最後一筆：\n"
-            f"  {last['payer']} 付了 ${last['amount']:.0f}（{last['description']}）"
-        )
+        detail_text = "\n".join(detail_lines) if detail_lines else ""
+        return summary, detail_text
 
     def get_history(self):
-        all_expenses = self.data["expenses"]
-        if not all_expenses:
-            return "📋 還沒有任何紀錄"
+        """消費紀錄：依日期倒序，所有未結清紀錄"""
+        active = [e for e in self.data["expenses"] if not e["cleared"]]
+        if not active:
+            return "📋 目前沒有消費紀錄"
 
-        lines = ["📋 所有紀錄（含已結清）", "──────────────────"]
-        for e in all_expenses[-20:]:  # 最近20筆
-            status = "✅" if e["cleared"] else "⏳"
-            if e["amount"] > 0:
-                lines.append(f"{status} #{e['id']} {e['date']} {e['payer']} ${e['amount']:.0f} {e['description']}")
-        
-        if len(all_expenses) > 20:
-            lines.append(f"（只顯示最近20筆，共{len(all_expenses)}筆）")
-        
+        # 倒序
+        reversed_active = list(reversed(active))
+        lines = ["📋 消費紀錄", "──────────────────"]
+        for e in reversed_active:
+            lines.append(f"{e['date']} {e['debtor']}：{e['description']}{e['amount']:.0f}")
+
         return "\n".join(lines)
+
+    def request_clear(self):
+        """發起銷帳確認"""
+        active = [e for e in self.data["expenses"] if not e["cleared"]]
+        if not active:
+            return "目前沒有任何未結清帳目，無需銷帳。", False
+
+        self.data["pending_clear"] = True
+        self._save()
+        return None, True  # 回傳 None 表示要用 Flex Message
+
+    def confirm_clear(self):
+        """確認銷帳：寫入歷史紀錄後清空帳目"""
+        self._ensure_keys()
+        active = [e for e in self.data["expenses"] if not e["cleared"]]
+
+        if active:
+            # 計算結算金額
+            net = {u: 0.0 for u in USERS}
+            for e in active:
+                net[e["debtor"]] += e["amount"]
+
+            u0, u1 = USERS[0], USERS[1]
+            diff = net[u0] - net[u1]
+
+            if abs(diff) < 0.5:
+                settlement = "兩人相抵，無需還款"
+            elif diff > 0:
+                settlement = f"{u0}給{u1} ${diff:.0f}"
+            else:
+                settlement = f"{u1}給{u0} ${abs(diff):.0f}"
+
+            # 日期範圍
+            dates = sorted(set(e["date"] for e in active))
+            date_range = f"{dates[0]}~{dates[-1]}" if len(dates) > 1 else dates[0]
+
+            # 寫入 history_log
+            log_entry = {
+                "cleared_date": datetime.now().strftime("%m/%d"),
+                "cleared_date_full": datetime.now().strftime("%Y-%m-%d"),
+                "settlement": settlement,
+                "date_range": date_range,
+                "expense_count": len(active)
+            }
+            self.data["history_log"].append(log_entry)
+
+            # 清除 3 個月前的舊紀錄
+            cutoff = (datetime.now() - timedelta(days=HISTORY_KEEP_DAYS)).strftime("%Y-%m-%d")
+            self.data["history_log"] = [
+                log for log in self.data["history_log"]
+                if log.get("cleared_date_full", "9999-99-99") >= cutoff
+            ]
+
+        self.data["expenses"] = []
+        self.data["pending_clear"] = False
+        self._save()
+        return "✅ 銷帳完成！所有帳目已清空。"
+
+    def get_history_log(self):
+        """歷史訊息：顯示每次銷帳的摘要，最新在上"""
+        self._ensure_keys()
+        logs = self.data["history_log"]
+        if not logs:
+            return "📂 目前沒有歷史銷帳紀錄"
+
+        lines = ["📂 歷史銷帳紀錄", "──────────────────"]
+        for log in reversed(logs):
+            lines.append(
+                f"{log['cleared_date']} {log['settlement']}"
+                f"（{log['date_range']} 已結清）"
+            )
+        lines.append("──────────────────")
+        lines.append("※ 紀錄保留 3 個月")
+        return "\n".join(lines)
+
+    def cancel_clear(self):
+        """取消銷帳"""
+        self.data["pending_clear"] = False
+        self._save()
+        return "↩️ 已取消，帳目保持不變。"
+
+    def is_pending_clear(self):
+        return self.data.get("pending_clear", False)
