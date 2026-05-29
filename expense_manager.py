@@ -7,39 +7,50 @@ DATA_FILE = 'expenses.json'
 USERS = ['心怡', '70']
 HISTORY_KEEP_DAYS = 90  # 保留 3 個月
 
+EMPTY_DATA = {
+    "expenses": [],
+    "pending_clear": False,
+    "history_log": []
+}
+
+def _load():
+    """每次都從磁碟讀取最新資料"""
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # 向下相容：補齊缺少的欄位
+        if "history_log" not in data:
+            data["history_log"] = []
+        if "pending_clear" not in data:
+            data["pending_clear"] = False
+        return data
+    return {
+        "expenses": [],
+        "pending_clear": False,
+        "history_log": []
+    }
+
+def _save(data):
+    """寫回磁碟"""
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 class ExpenseManager:
-    def __init__(self):
-        self.data = self._load()
-
-    def _load(self):
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        # 初始結構
-        return {
-            "expenses": [],
-            "pending_clear": False,
-            "history_log": []   # 每次銷帳後留存的摘要紀錄
-        }
-
-    def _ensure_keys(self):
-        """向下相容：舊資料沒有 history_log 時補上"""
-        if "history_log" not in self.data:
-            self.data["history_log"] = []
-
-    def _save(self):
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+    """
+    每個 public method 開頭都呼叫 _load()，結尾都呼叫 _save()，
+    確保多個 gunicorn worker 之間不會互相覆蓋彼此的資料。
+    """
 
     def parse_expense(self, text):
         """
         解析記帳格式：心怡:麥當勞120
         回傳 (欠款方, 說明, 金額) 或 None
+        純解析，不讀寫檔案。
         """
         for user in USERS:
             if text.startswith(user + ':') or text.startswith(user + '：'):
                 rest = text[len(user) + 1:].strip()
-                # 從字串尾端抓數字
                 match = re.search(r'(\d+(?:\.\d+)?)$', rest)
                 if match:
                     amount = float(match.group(1))
@@ -51,42 +62,40 @@ class ExpenseManager:
 
     def add_expense(self, debtor, description, amount):
         """記錄一筆欠款：debtor 欠另一方"""
-        # 付款方是另一個人
+        data = _load()                          # ← 每次重新讀檔
         creditor = [u for u in USERS if u != debtor][0]
         record = {
-            "id": len(self.data["expenses"]) + 1,
-            "debtor": debtor,       # 欠款方（被記的人）
-            "creditor": creditor,   # 付款方
+            "id": len(data["expenses"]) + 1,
+            "debtor": debtor,
+            "creditor": creditor,
             "amount": amount,
             "description": description,
             "date": datetime.now().strftime("%m/%d"),
             "cleared": False
         }
-        self.data["expenses"].append(record)
-        self._save()
+        data["expenses"].append(record)
+        _save(data)                             # ← 寫回磁碟
         return (
             f"✅ 已記錄\n"
             f"{creditor} 幫 {debtor} 付了 ${amount:.0f}（{description}）"
         )
 
     def get_balance(self):
-        """結算：計算未結清帳目，回傳結算文字與明細資料"""
-        active = [e for e in self.data["expenses"] if not e["cleared"]]
+        """結算：計算未結清帳目，回傳 (摘要文字, 明細文字)"""
+        data = _load()
+        active = [e for e in data["expenses"] if not e["cleared"]]
         if not active:
             return "🎉 目前沒有未結清帳目！", None
 
-        # 計算每人淨欠款
-        # net[user] = 該 user 欠對方的錢（正數 = 欠，負數 = 被欠）
         net = {u: 0.0 for u in USERS}
-        details = {u: [] for u in USERS}  # 每人被記的明細
+        details = {u: [] for u in USERS}
 
         for e in active:
             net[e["debtor"]] += e["amount"]
             details[e["debtor"]].append(f"{e['description']}{e['amount']:.0f}")
 
-        # 判斷誰欠誰
         u0, u1 = USERS[0], USERS[1]
-        diff = net[u0] - net[u1]  # 正 = 心怡欠70，負 = 70欠心怡
+        diff = net[u0] - net[u1]
 
         if abs(diff) < 0.5:
             summary = "🟰 目前兩人帳目相抵，不需要還款！"
@@ -95,7 +104,6 @@ class ExpenseManager:
         else:
             summary = f"💸 {u1} 要給 {u0}  ${abs(diff):.0f}"
 
-        # 組明細字串
         detail_lines = []
         for user in USERS:
             if details[user]:
@@ -107,35 +115,33 @@ class ExpenseManager:
 
     def get_history(self):
         """消費紀錄：依日期倒序，所有未結清紀錄"""
-        active = [e for e in self.data["expenses"] if not e["cleared"]]
+        data = _load()
+        active = [e for e in data["expenses"] if not e["cleared"]]
         if not active:
             return "📋 目前沒有消費紀錄"
 
-        # 倒序
-        reversed_active = list(reversed(active))
         lines = ["📋 消費紀錄", "──────────────────"]
-        for e in reversed_active:
+        for e in reversed(active):
             lines.append(f"{e['date']} {e['debtor']}：{e['description']}{e['amount']:.0f}")
-
         return "\n".join(lines)
 
     def request_clear(self):
-        """發起銷帳確認"""
-        active = [e for e in self.data["expenses"] if not e["cleared"]]
+        """發起銷帳確認，回傳 (文字訊息 or None, 是否需要 Flex)"""
+        data = _load()
+        active = [e for e in data["expenses"] if not e["cleared"]]
         if not active:
             return "目前沒有任何未結清帳目，無需銷帳。", False
 
-        self.data["pending_clear"] = True
-        self._save()
-        return None, True  # 回傳 None 表示要用 Flex Message
+        data["pending_clear"] = True
+        _save(data)
+        return None, True
 
     def confirm_clear(self):
         """確認銷帳：寫入歷史紀錄後清空帳目"""
-        self._ensure_keys()
-        active = [e for e in self.data["expenses"] if not e["cleared"]]
+        data = _load()
+        active = [e for e in data["expenses"] if not e["cleared"]]
 
         if active:
-            # 計算結算金額
             net = {u: 0.0 for u in USERS}
             for e in active:
                 net[e["debtor"]] += e["amount"]
@@ -150,11 +156,9 @@ class ExpenseManager:
             else:
                 settlement = f"{u1}給{u0} ${abs(diff):.0f}"
 
-            # 日期範圍
             dates = sorted(set(e["date"] for e in active))
             date_range = f"{dates[0]}~{dates[-1]}" if len(dates) > 1 else dates[0]
 
-            # 寫入 history_log
             log_entry = {
                 "cleared_date": datetime.now().strftime("%m/%d"),
                 "cleared_date_full": datetime.now().strftime("%Y-%m-%d"),
@@ -162,24 +166,24 @@ class ExpenseManager:
                 "date_range": date_range,
                 "expense_count": len(active)
             }
-            self.data["history_log"].append(log_entry)
+            data["history_log"].append(log_entry)
 
             # 清除 3 個月前的舊紀錄
             cutoff = (datetime.now() - timedelta(days=HISTORY_KEEP_DAYS)).strftime("%Y-%m-%d")
-            self.data["history_log"] = [
-                log for log in self.data["history_log"]
+            data["history_log"] = [
+                log for log in data["history_log"]
                 if log.get("cleared_date_full", "9999-99-99") >= cutoff
             ]
 
-        self.data["expenses"] = []
-        self.data["pending_clear"] = False
-        self._save()
+        data["expenses"] = []
+        data["pending_clear"] = False
+        _save(data)
         return "✅ 銷帳完成！所有帳目已清空。"
 
     def get_history_log(self):
         """歷史訊息：顯示每次銷帳的摘要，最新在上"""
-        self._ensure_keys()
-        logs = self.data["history_log"]
+        data = _load()
+        logs = data["history_log"]
         if not logs:
             return "📂 目前沒有歷史銷帳紀錄"
 
@@ -195,9 +199,11 @@ class ExpenseManager:
 
     def cancel_clear(self):
         """取消銷帳"""
-        self.data["pending_clear"] = False
-        self._save()
+        data = _load()
+        data["pending_clear"] = False
+        _save(data)
         return "↩️ 已取消，帳目保持不變。"
 
     def is_pending_clear(self):
-        return self.data.get("pending_clear", False)
+        data = _load()
+        return data.get("pending_clear", False)
